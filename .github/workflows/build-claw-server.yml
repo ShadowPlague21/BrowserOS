@@ -1,0 +1,98 @@
+name: Build & Release BrowserOS Claw Server
+
+on:
+  schedule:
+    # Run every Monday at midnight UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: 'Sync with upstream before building?'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64 Binary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with Upstream (if requested)
+        if: ${{ github.event.inputs.sync_upstream == 'true' || github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/browseros-ai/BrowserOS.git || true
+          git fetch upstream main
+          echo "Attempting fast-forward / merge from upstream..."
+          git merge upstream/main -m "chore: sync with upstream main" || {
+            echo "Merge conflict occurred, restoring patch on top of upstream"
+            git merge --abort || true
+            git rebase upstream/main || true
+          }
+          # Ensure LAN binding patch is applied
+          file="packages/browseros-agent/apps/claw-server/src/main.rs"
+          if grep -q '127, 0, 0, 1' "$file"; then
+            sed -i 's/127, 0, 0, 1/0, 0, 0, 0/g' "$file"
+            git add "$file"
+            git commit -m "feat(claw-server): re-apply LAN binding patch" || true
+            git push origin main || true
+          fi
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "packages/browseros-agent -> target"
+
+      - name: Build Claw Server
+        shell: bash
+        working-directory: packages/browseros-agent
+        run: |
+          cargo build --release --bin browseros-claw-server-rs
+
+      - name: Prepare Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Copy binary and name it browseros-claw-server.exe
+          cp packages/browseros-agent/target/release/browseros-claw-server-rs.exe dist/browseros-claw-server.exe
+          cd dist
+          certutil -hashfile browseros-claw-server.exe SHA256 > browseros-claw-server.exe.sha256
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: browseros-claw-server-windows
+          path: dist/*
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "claw-server-build-${{ github.run_number }}"
+          name: "BrowserOS Claw Server (LAN Enabled) - Build ${{ github.run_number }}"
+          body: |
+            Automated build of BrowserOS Neo Claw Server (`browseros-claw-server.exe`).
+            - **Commit:** ${{ github.sha }}
+            - **LAN Enabled:** Patched to bind `0.0.0.0` so AI agents across the local network can access BrowserOS Neo.
+          files: |
+            dist/browseros-claw-server.exe
+            dist/browseros-claw-server.exe.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
