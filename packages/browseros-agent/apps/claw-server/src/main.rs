@@ -240,7 +240,8 @@ async fn serve_with_boot_task(
     analytics: Arc<dyn AnalyticsSink>,
     boot_task: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.server_port));
+    // Allow listening on LAN (0.0.0.0) for local network AI agent automation
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
