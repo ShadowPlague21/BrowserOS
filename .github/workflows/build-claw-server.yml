@@ -6,88 +6,133 @@ on:
     - cron: '0 0 * * 1'
   workflow_dispatch:
     inputs:
-      sync_upstream:
-        description: 'Sync with upstream before building?'
-        required: true
+      force_build:
+        description: 'Force build even if upstream has no new updates?'
+        required: false
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build Windows x64 Binary
+  check-and-build:
+    name: Check Upstream, Sync & Build Claw Server
     runs-on: windows-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync with Upstream (if requested)
-        if: ${{ github.event.inputs.sync_upstream == 'true' || github.event_name == 'schedule' }}
+      - name: Check Upstream Updates
+        id: check_upstream
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git remote add upstream https://github.com/browseros-ai/BrowserOS.git || true
           git fetch upstream main
-          echo "Attempting fast-forward / merge from upstream..."
-          git merge upstream/main -m "chore: sync with upstream main" || {
-            echo "Merge conflict occurred, restoring patch on top of upstream"
-            git merge --abort || true
-            git rebase upstream/main || true
-          }
-          # Ensure LAN binding patch is applied
-          file="packages/browseros-agent/apps/claw-server/src/main.rs"
-          if grep -q '127, 0, 0, 1' "$file"; then
-            sed -i 's/127, 0, 0, 1/0, 0, 0, 0/g' "$file"
-            git add "$file"
-            git commit -m "feat(claw-server): re-apply LAN binding patch" || true
-            git push origin main || true
+
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          MERGE_BASE=$(git merge-base HEAD upstream/main)
+
+          echo "Current Fork HEAD: $(git rev-parse HEAD)"
+          echo "Upstream HEAD:     $UPSTREAM_HEAD"
+          echo "Merge Base:        $MERGE_BASE"
+
+          FORCE_BUILD="${{ inputs.force_build }}"
+
+          if [ "$UPSTREAM_HEAD" != "$MERGE_BASE" ]; then
+            echo "🚀 Upstream has new updates!"
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FORCE_BUILD" = "true" ]; then
+            echo "⚡ Force build requested despite no upstream updates."
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Upstream has not updated since last sync. Nothing to do."
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Sync with Upstream & Apply LAN Patch
+        if: steps.check_upstream.outputs.has_updates == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Syncing with upstream/main..."
+
+          # Attempt merge from upstream/main
+          if ! git merge upstream/main -m "chore: sync with upstream main [skip ci]"; then
+            echo "Merge conflict occurred. Attempting rebase..."
+            git merge --abort || true
+            git rebase upstream/main
+          fi
+
+          # Ensure LAN binding patch (0.0.0.0) is applied
+          FILE="packages/browseros-agent/apps/claw-server/src/main.rs"
+          if grep -q '127, 0, 0, 1' "$FILE"; then
+            echo "Applying 0.0.0.0 LAN binding patch to $FILE..."
+            sed -i 's/127, 0, 0, 1/0, 0, 0, 0/g' "$FILE"
+            git add "$FILE"
+            git commit -m "feat(claw-server): bind listener to 0.0.0.0 for LAN agent access [skip ci]" || true
+          else
+            echo "LAN binding already in place in $FILE"
+          fi
+
+          echo "Pushing synced changes to origin/main..."
+          git push origin main
+
       - name: Setup Rust Toolchain
+        if: steps.check_upstream.outputs.should_build == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Rust Cache
+        if: steps.check_upstream.outputs.should_build == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "packages/browseros-agent -> target"
 
       - name: Build Claw Server
+        if: steps.check_upstream.outputs.should_build == 'true'
         shell: bash
         working-directory: packages/browseros-agent
         run: |
           cargo build --release --bin browseros-claw-server-rs
 
       - name: Prepare Artifacts
+        if: steps.check_upstream.outputs.should_build == 'true'
         shell: bash
         run: |
           mkdir -p dist
-          # Copy binary and name it browseros-claw-server.exe
           cp packages/browseros-agent/target/release/browseros-claw-server-rs.exe dist/browseros-claw-server.exe
           cd dist
           certutil -hashfile browseros-claw-server.exe SHA256 > browseros-claw-server.exe.sha256
 
       - name: Upload Artifact
+        if: steps.check_upstream.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: browseros-claw-server-windows
           path: dist/*
 
       - name: Publish GitHub Release
+        if: steps.check_upstream.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "claw-server-build-${{ github.run_number }}"
           name: "BrowserOS Claw Server (LAN Enabled) - Build ${{ github.run_number }}"
           body: |
             Automated build of BrowserOS Neo Claw Server (`browseros-claw-server.exe`).
-            - **Commit:** ${{ github.sha }}
+            - **Source Commit:** ${{ github.sha }}
             - **LAN Enabled:** Patched to bind `0.0.0.0` so AI agents across the local network can access BrowserOS Neo.
           files: |
             dist/browseros-claw-server.exe
