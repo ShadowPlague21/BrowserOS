@@ -2054,9 +2054,9 @@ async fn get_agent_settings(app: &TestApp) -> anyhow::Result<(StatusCode, Vec<u8
 /// The source itself is not pinned here: whether it is `environment` depends on whether
 /// JEV_TOKEN is set in the shell that ran the suite, and precedence has deterministic tests of
 /// its own in the settings store.
-fn assert_agent_settings(body: &serde_json::Value, human_help: bool, cleanup: bool) {
+fn assert_agent_settings(body: &serde_json::Value, human_help: bool) {
     assert_eq!(body["humanHelpEnabled"], json!(human_help));
-    assert_eq!(body["closeTabGroupsAfterTask"], json!(cleanup));
+    assert!(body["taskCleanupTipEnabled"].is_boolean());
     let source = body["jevTokenSource"].as_str().unwrap_or_default();
     assert!(
         ["settings", "environment", "none"].contains(&source),
@@ -2089,7 +2089,56 @@ async fn tests_that_agent_settings_offer_human_help_by_default() -> anyhow::Resu
     let app = test_app().await?;
     let (status, bytes) = get_agent_settings(&app).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_agent_settings(&json_body(&bytes)?, true, false);
+    assert_agent_settings(&json_body(&bytes)?, true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tests_that_cleanup_tip_is_opt_in_and_saved_independently() -> anyhow::Result<()> {
+    let app = test_app().await?;
+    let (_, bytes) = get_agent_settings(&app).await?;
+    assert_eq!(json_body(&bytes)?["taskCleanupTipEnabled"], false);
+
+    for enabled in [true, false, true] {
+        let (status, bytes) = put_agent_settings(
+            &app,
+            json!({ "humanHelpEnabled": false, "taskCleanupTipEnabled": enabled }).to_string(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_body(&bytes)?["taskCleanupTipEnabled"], enabled);
+        let saved: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(app.state.config.browserclaw_dir.join("agent-settings.json")).await?,
+        )?;
+        assert_eq!(saved["taskCleanupTipEnabled"], enabled);
+        assert_eq!(saved["humanHelpEnabled"], false);
+    }
+
+    let (status, bytes) =
+        put_agent_settings(&app, json!({ "humanHelpEnabled": true }).to_string()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&bytes)?["taskCleanupTipEnabled"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tests_that_cleanup_only_updates_preserve_the_saved_human_help_choice() -> anyhow::Result<()>
+{
+    let app = test_app().await?;
+    for (human_help, cleanup_tip) in [(false, true), (true, false)] {
+        let (status, _) =
+            put_agent_settings(&app, json!({ "humanHelpEnabled": human_help }).to_string()).await?;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, bytes) = put_agent_settings(
+            &app,
+            json!({ "taskCleanupTipEnabled": cleanup_tip }).to_string(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_agent_settings(&json_body(&bytes)?, human_help);
+        assert_eq!(json_body(&bytes)?["taskCleanupTipEnabled"], cleanup_tip);
+    }
     Ok(())
 }
 
@@ -2099,11 +2148,11 @@ async fn tests_that_turning_human_help_off_is_saved_and_read_back() -> anyhow::R
     let (status, bytes) =
         put_agent_settings(&app, json!({ "humanHelpEnabled": false }).to_string()).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_agent_settings(&json_body(&bytes)?, false, false);
+    assert_agent_settings(&json_body(&bytes)?, false);
 
     let (status, bytes) = get_agent_settings(&app).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_agent_settings(&json_body(&bytes)?, false, false);
+    assert_agent_settings(&json_body(&bytes)?, false);
     Ok(())
 }
 
@@ -2112,6 +2161,7 @@ async fn tests_that_a_non_boolean_human_help_setting_is_rejected() -> anyhow::Re
     let app = test_app().await?;
     for body in [
         json!({ "humanHelpEnabled": "no" }).to_string(),
+        json!({ "humanHelpEnabled": true, "taskCleanupTipEnabled": "yes" }).to_string(),
         json!({}).to_string(),
         "not json".to_string(),
     ] {
@@ -2120,13 +2170,13 @@ async fn tests_that_a_non_boolean_human_help_setting_is_rejected() -> anyhow::Re
         let error = json_body(&bytes)?;
         assert_eq!(error["code"], "invalid_request", "{body}");
         assert_eq!(
-            error["message"], "humanHelpEnabled must be a boolean",
+            error["message"], "humanHelpEnabled and taskCleanupTipEnabled must be booleans",
             "{body}"
         );
     }
 
     let (_, bytes) = get_agent_settings(&app).await?;
-    assert_agent_settings(&json_body(&bytes)?, true, false);
+    assert_agent_settings(&json_body(&bytes)?, true);
     Ok(())
 }
 
@@ -2143,128 +2193,7 @@ async fn tests_that_a_failed_agent_settings_save_is_a_500_and_changes_nothing() 
     assert_eq!(json_body(&bytes)?["code"], "internal_error");
 
     let (_, bytes) = get_agent_settings(&app).await?;
-    assert_agent_settings(&json_body(&bytes)?, true, false);
-    Ok(())
-}
-
-#[tokio::test]
-async fn tests_that_cleanup_settings_round_trip_in_both_states() -> anyhow::Result<()> {
-    let app = test_app().await?;
-    for human_help in [false, true] {
-        for cleanup in [true, false] {
-            let settings = json!({
-                "humanHelpEnabled": human_help,
-                "closeTabGroupsAfterTask": cleanup,
-            });
-            let (status, bytes) = put_agent_settings(&app, settings.to_string()).await?;
-            assert_eq!(status, StatusCode::OK);
-            assert_agent_settings(&json_body(&bytes)?, human_help, cleanup);
-
-            let (status, bytes) = get_agent_settings(&app).await?;
-            assert_eq!(status, StatusCode::OK);
-            assert_agent_settings(&json_body(&bytes)?, human_help, cleanup);
-
-            let saved: Value = serde_json::from_str(&std::fs::read_to_string(
-                app.state.config.browserclaw_dir.join("agent-settings.json"),
-            )?)?;
-            assert_eq!(saved, settings);
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn tests_that_older_requests_preserve_enabled_cleanup() -> anyhow::Result<()> {
-    let app = test_app().await?;
-    let (status, _) = put_agent_settings(
-        &app,
-        json!({ "humanHelpEnabled": true, "closeTabGroupsAfterTask": true }).to_string(),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, bytes) =
-        put_agent_settings(&app, json!({ "humanHelpEnabled": false }).to_string()).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_agent_settings(&json_body(&bytes)?, false, true);
-    let saved: Value = serde_json::from_str(&std::fs::read_to_string(
-        app.state.config.browserclaw_dir.join("agent-settings.json"),
-    )?)?;
-    assert_eq!(saved["closeTabGroupsAfterTask"], true);
-    Ok(())
-}
-
-#[tokio::test]
-async fn tests_that_invalid_cleanup_values_do_not_change_either_setting() -> anyhow::Result<()> {
-    let app = test_app().await?;
-    let (status, _) = put_agent_settings(
-        &app,
-        json!({ "humanHelpEnabled": false, "closeTabGroupsAfterTask": true }).to_string(),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let path = app.state.config.browserclaw_dir.join("agent-settings.json");
-    let before = std::fs::read(&path)?;
-
-    for cleanup in [json!("true"), Value::Null, json!(1), json!([]), json!({})] {
-        let body = json!({ "humanHelpEnabled": true, "closeTabGroupsAfterTask": cleanup });
-        let (status, bytes) = put_agent_settings(&app, body.to_string()).await?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let error = json_body(&bytes)?;
-        assert_eq!(error["code"], "invalid_request");
-        assert_eq!(
-            error["message"],
-            "closeTabGroupsAfterTask must be a boolean"
-        );
-        let (_, bytes) = get_agent_settings(&app).await?;
-        assert_agent_settings(&json_body(&bytes)?, false, true);
-        assert_eq!(std::fs::read(&path)?, before);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn tests_that_cleanup_requests_still_require_boolean_human_help() -> anyhow::Result<()> {
-    let app = test_app().await?;
-    for body in [
-        json!({ "closeTabGroupsAfterTask": true }),
-        json!({ "humanHelpEnabled": null, "closeTabGroupsAfterTask": true }),
-        json!({ "humanHelpEnabled": "false", "closeTabGroupsAfterTask": true }),
-    ] {
-        let (status, bytes) = put_agent_settings(&app, body.to_string()).await?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(
-            json_body(&bytes)?["message"],
-            "humanHelpEnabled must be a boolean"
-        );
-    }
-    let (_, bytes) = get_agent_settings(&app).await?;
-    assert_agent_settings(&json_body(&bytes)?, true, false);
-    Ok(())
-}
-
-#[tokio::test]
-async fn tests_that_a_failed_cleanup_save_keeps_both_previous_values() -> anyhow::Result<()> {
-    let app = test_app().await?;
-    let (status, _) = put_agent_settings(
-        &app,
-        json!({ "humanHelpEnabled": false, "closeTabGroupsAfterTask": true }).to_string(),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let path = app.state.config.browserclaw_dir.join("agent-settings.json");
-    std::fs::remove_file(&path)?;
-    std::fs::create_dir(&path)?;
-
-    let (status, bytes) = put_agent_settings(
-        &app,
-        json!({ "humanHelpEnabled": true, "closeTabGroupsAfterTask": false }).to_string(),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(json_body(&bytes)?["code"], "internal_error");
-    let (_, bytes) = get_agent_settings(&app).await?;
-    assert_agent_settings(&json_body(&bytes)?, false, true);
+    assert_agent_settings(&json_body(&bytes)?, true);
     Ok(())
 }
 

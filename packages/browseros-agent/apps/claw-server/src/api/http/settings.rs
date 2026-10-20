@@ -12,9 +12,9 @@ use axum::{
     http::StatusCode,
 };
 use claw_api::models::{
-    AgentSettings, JevTokenSource, SaveJevTokenRequest, TelemetryState, UpdateTelemetryRequest,
+    AgentSettings, JevTokenSource, SaveJevTokenRequest, TelemetryState, UpdateAgentSettingsRequest,
+    UpdateTelemetryRequest,
 };
-use serde_json::Value;
 
 pub(super) async fn telemetry(State(state): State<AppState>) -> Json<TelemetryState> {
     Json(to_contract_state(state.analytics.get_state().await))
@@ -48,38 +48,24 @@ pub(super) async fn agent(State(state): State<AppState>) -> Json<AgentSettings> 
 pub(super) async fn update_agent(
     Extension(request_id): Extension<RequestId>,
     State(state): State<AppState>,
-    payload: Result<Json<Value>, JsonRejection>,
+    payload: Result<Json<UpdateAgentSettingsRequest>, JsonRejection>,
 ) -> Result<Json<AgentSettings>, CanonicalError> {
-    let invalid_human_help = || {
+    let invalid_settings = || {
         error(
             &request_id,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "humanHelpEnabled must be a boolean",
+            "humanHelpEnabled and taskCleanupTipEnabled must be booleans",
         )
     };
-    let Json(payload) = payload.map_err(|_| invalid_human_help())?;
-    let human_help = payload
-        .get("humanHelpEnabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(invalid_human_help)?;
-    // An optional generated bool treats null as omission; the HTTP contract does not.
-    let cleanup = payload
-        .get("closeTabGroupsAfterTask")
-        .map(|value| {
-            value.as_bool().ok_or_else(|| {
-                error(
-                    &request_id,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "closeTabGroupsAfterTask must be a boolean",
-                )
-            })
-        })
-        .transpose()?;
+    let Json(payload) = payload.map_err(|_| invalid_settings())?;
+    if payload.human_help_enabled.is_none() && payload.task_cleanup_tip_enabled.is_none() {
+        return Err(invalid_settings());
+    }
+    let human_help = payload.human_help_enabled.map(HumanHelp::from_enabled);
     state
         .agent_settings
-        .set_settings(Some(HumanHelp::from_enabled(human_help)), cleanup)
+        .update(human_help, payload.task_cleanup_tip_enabled)
         .await
         .map_err(|source| internal(&request_id, source))?;
     Ok(Json(settings_of(&state)))
@@ -140,7 +126,7 @@ fn to_contract_state(state: crate::analytics::TelemetryState) -> TelemetryState 
 fn settings_of(state: &AppState) -> AgentSettings {
     AgentSettings::new(
         state.agent_settings.human_help().is_enabled(),
-        state.agent_settings.close_tab_groups_after_task(),
+        state.agent_settings.task_cleanup_tip_enabled(),
         to_contract_source(state.agent_settings.jev_token_source()),
     )
 }
